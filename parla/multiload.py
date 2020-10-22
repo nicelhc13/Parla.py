@@ -130,7 +130,7 @@ class MultiloadThreadLocals(threading.local):
         return self.context_stack[-1]
 
     @property
-    def in_progress(self) -> list:
+    def in_progress(self) -> dict:
         if not hasattr(self, "_in_progress"):
             self._in_progress = dict()
         return self._in_progress
@@ -618,6 +618,7 @@ class ModuleImport:
             loaded_module = sys.modules[self.full_name]
             assert is_forwarding(loaded_module)
         elif self.is_multiload:
+            # XXX: in_progress is unused
             in_progress = get_in_progress(self.full_name)
             update_sysmodules_from_in_progress(self.full_name)
             loaded_module = sys.modules.pop(self.full_name)
@@ -683,6 +684,7 @@ def check_for_bad_multiload(full_name):
 def build_import_tree(full_name, fromlist):
     short_names = full_name.split(".")
     full_names = [".".join(short_names[:i+1]) for i in range(len(short_names))]
+    # XXX: started_multiloading is unused
     started_multiloading = False
     root = ModuleImport(full_names[0], short_names[0])
     previous = root
