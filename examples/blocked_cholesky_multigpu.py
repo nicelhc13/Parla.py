@@ -23,6 +23,7 @@ from cupy.cuda import device
 from cupy.linalg import _util
 
 from scipy import linalg
+import sys
 
 loc = gpu
 
@@ -32,6 +33,10 @@ gpu_arrs = []
 EXEC_SOL = False
 EXEC_MULT_GPU = True
 #EXEC_MULT_GPU = False
+
+# Configure environment
+block_size = int(sys.argv[1])
+n = block_size*int(sys.argv[2])
 
 @specialized
 @jit(float64[:,:](float64[:,:]), nopython=True, nogil=True)
@@ -145,6 +150,7 @@ def cholesky_blocked_inplace(a, num_gpus):
                   out = get_gpu_memory(j, j, num_gpus)
                   rhs = get_gpu_memory(j, k, num_gpus)
                   out = update(rhs, rhs, out)
+                  cp.cuda.Device().synchronize()
                   set_gpu_memory_from_gpu(j, j, num_gpus, out)
 
                 if EXEC_SOL and EXEC_MULT_GPU:
@@ -161,6 +167,7 @@ def cholesky_blocked_inplace(a, num_gpus):
             if EXEC_MULT_GPU:
               dblock = get_gpu_memory(j, j, num_gpus) 
               dblock = cholesky(dblock)
+              cp.cuda.Device().synchronize()
               set_gpu_memory_from_gpu(j, j, num_gpus, dblock)
 
             if EXEC_SOL and EXEC_MULT_GPU:
@@ -183,7 +190,9 @@ def cholesky_blocked_inplace(a, num_gpus):
                       out = get_gpu_memory(i, j, num_gpus)
                       rhs1 = get_gpu_memory(i, k, num_gpus)
                       rhs2 = copy_gpu_memory(cur_id, j, k, num_gpus)
+                      cp.cuda.Device().synchronize()
                       out = update(rhs1, rhs2, out)
+                      cp.cuda.Device().synchronize()
                       set_gpu_memory_from_gpu(i, j, num_gpus, out)
                     if EXEC_SOL and EXEC_MULT_GPU:
                       print (out, " and ", a[i,j])
@@ -201,7 +210,9 @@ def cholesky_blocked_inplace(a, num_gpus):
                   cur_id = i % num_gpus
                   factor = copy_gpu_memory(cur_id, j, j, num_gpus)
                   panel  = get_gpu_memory(i, j, num_gpus)
+                  cp.cuda.Device().synchronize()
                   out = ltriang_solve(factor, panel)
+                  cp.cuda.Device().synchronize()
                   set_gpu_memory_from_gpu(i, j, num_gpus, out)
 
                 if EXEC_SOL and EXEC_MULT_GPU:
@@ -219,14 +230,14 @@ def set_device(i:int):
 
 def allocate_gpu_memory(i:int, r:int, n:int, b:int):
     with cp.cuda.Device(i):
+      print("\tAllocate device:", i, "...")
       prealloced = cp.ndarray([r, n // b, b, b])
       gpu_arrs.append(prealloced)
 
 def copy_gpu_memory(cur_id:int, i:int, j:int, num_gpus:int):
     dev_id   = i % num_gpus
     local_id = i // num_gpus
-    with cp.cuda.Device(cur_id):
-      return cp.array(gpu_arrs[dev_id][local_id][j], copy=True)
+    return cp.array(gpu_arrs[dev_id][local_id][j], copy=True)
 
 def get_gpu_memory(i:int, j:int, num_gpus:int):
     dev_id   = i % num_gpus
@@ -242,21 +253,23 @@ def set_gpu_memory_from_cpu(a, num_gpus):
     for j in range(a.shape[0]):
       dev_id   = j % num_gpus 
       local_id = j // num_gpus 
+      print("Device:", dev_id, " gets data from CPU")
       with cp.cuda.Device(dev_id):
         gpu_arrs[dev_id][local_id] = cp.array(a[j], copy=True)
+      cp.cuda.Device(dev_id).synchronize()
+      print("Device:", dev_id, " done")
 
 def main():
     num_gpus = cp.cuda.runtime.getDeviceCount()
     @spawn(placement=cpu)
     async def test_blocked_cholesky():
-        # Configure environment
-        block_size = 32*5
-        n = block_size*16
+        print("Block size=", block_size, " and total array size=", n)
         #block_size = 2
         #n = block_size * 7 
         assert not n % block_size
 
         if EXEC_MULT_GPU:
+          print("Allocate memory..")
           for d in range(num_gpus):
             row_size = n // (block_size * num_gpus)
             if d < ((n / block_size) % num_gpus):
@@ -268,29 +281,43 @@ def main():
               """
             if row_size > 0:
               allocate_gpu_memory(d, row_size, n, block_size)
+          print("Allocate memory done..")
 
         np.random.seed(10)
+
+        print("Random number generate..")
         # Construct input data
         a = np.random.rand(n, n)
         a = a @ a.T
 
+        print("Random number generate done..")
+
+        print("Copy a to a1..")
         # Copy and layout input
         a1 = a.copy()
+        print("Copying done..")
+        print("Shaping starts..")
         ap = a1.reshape(n // block_size, block_size, n // block_size, block_size).swapaxes(1,2)
-        start = time.perf_counter()
+        print("Shaping done..")
         if EXEC_MULT_GPU:
           set_gpu_memory_from_cpu(ap, num_gpus)
 
+        start = time.perf_counter()
+        print("Calculate starts..")
         # Call Parla Cholesky result and wait for completion
         await cholesky_blocked_inplace(ap, num_gpus)
+        print("Calculate done..")
 
         end = time.perf_counter()
         print(end - start, "seconds")
 
         if EXEC_MULT_GPU:
           for d in range(num_gpus):
+            print("Device:", d, " swap array..")
             gpu_arrs[d] = cp.swapaxes(gpu_arrs[d], 2, 1)
+            print("Device:", d, " swap done..")
 
+          print("Convert GPU to CPU..")
           cpu_arrs = cp.asnumpy(gpu_arrs[0][0][0])
           for r_num in range(n // block_size):
             dev_id   = r_num % num_gpus 
@@ -302,13 +329,15 @@ def main():
                 loop = False
                 continue
               cpu_arrs = np.concatenate((cpu_arrs, cpu_sub_sub_arr))
+          print("Convert GPU to CPU [done]..")
+          print("Reshape CPU..")
           cpu_arrs = cpu_arrs.reshape(n, n)
+          print("Reshape CPU [done] ..")
           """
           for s in range(1, len(gpu_arrs)):
             cpu_arrs = np.concatenate((cpu_arrs, cp.asnumpy(gpu_arrs[s])))
             """
           #cpu_arrs = cpu_arrs.swapaxes(1,2).reshape(n, n)
-
         print("Truth", linalg.cholesky(a).T)
 
         # Check result
